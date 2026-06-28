@@ -22,6 +22,10 @@ struct _GsPluginOpenStore
   GHashTable               *active_package_map;
   GsPluginProgressCallback  current_progress_callback;
   gpointer                  current_progress_user_data;
+
+  /* Pending GTasks awaiting completion via D-Bus signal */
+  GTask *pending_install_task;
+  GTask *pending_upgrade_task;
 };
 
 G_DEFINE_TYPE (GsPluginOpenStore, gs_plugin_openstore, GS_TYPE_PLUGIN);
@@ -47,6 +51,50 @@ on_openstore_dbus_signal (GDBusProxy *proxy, const gchar *sender_name,
     const gchar *status = NULL;
     g_variant_get (parameters, "(&s&s)", &package_id, &status);
     g_debug ("OpenStore install status for %s: %s", package_id, status);
+  } else if (g_strcmp0 (signal_name, "AppInstalled") == 0) {
+    const gchar *package_id = NULL;
+    g_variant_get (parameters, "(&s)", &package_id);
+    GsApp *app = g_hash_table_lookup (self->active_package_map, package_id);
+    if (app != NULL)
+      gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+    if (self->pending_install_task != NULL) {
+      g_hash_table_remove_all (self->active_package_map);
+      self->current_progress_callback = NULL;
+      self->current_progress_user_data = NULL;
+      g_task_return_boolean (self->pending_install_task, TRUE);
+      g_clear_object (&self->pending_install_task);
+    }
+  } else if (g_strcmp0 (signal_name, "InstallFailed") == 0) {
+    const gchar *package_id = NULL;
+    const gchar *error_msg = NULL;
+    g_variant_get (parameters, "(&s&s)", &package_id, &error_msg);
+    GsApp *app = g_hash_table_lookup (self->active_package_map, package_id);
+    if (app != NULL)
+      gs_app_set_state_recover (app);
+    if (self->pending_install_task != NULL) {
+      g_hash_table_remove_all (self->active_package_map);
+      self->current_progress_callback = NULL;
+      self->current_progress_user_data = NULL;
+      g_task_return_new_error (self->pending_install_task, G_IO_ERROR, G_IO_ERROR_FAILED,
+                               "%s", error_msg);
+      g_clear_object (&self->pending_install_task);
+    }
+  } else if (g_strcmp0 (signal_name, "UpgradeComplete") == 0) {
+    gboolean success = FALSE;
+    g_variant_get (parameters, "(b)", &success);
+    g_hash_table_remove_all (self->active_package_map);
+    self->current_progress_callback = NULL;
+    self->current_progress_user_data = NULL;
+    if (self->pending_upgrade_task != NULL) {
+      if (success) {
+        gs_plugin_updates_changed (GS_PLUGIN (self));
+        g_task_return_boolean (self->pending_upgrade_task, TRUE);
+      } else {
+        g_task_return_new_error (self->pending_upgrade_task, G_IO_ERROR, G_IO_ERROR_FAILED,
+                                 "Upgrade failed");
+      }
+      g_clear_object (&self->pending_upgrade_task);
+    }
   }
 }
 
@@ -585,36 +633,36 @@ openstore_install_app_cb (GObject *source_object,
   g_autoptr (GVariant) result = NULL;
   GsAppList *install_list = g_task_get_task_data (task);
 
-  g_hash_table_remove_all (self->active_package_map);
-  self->current_progress_callback = NULL;
-  self->current_progress_user_data = NULL;
-
-  if (install_list == NULL || gs_app_list_length (install_list) == 0) {
-    g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
-                             "No app in install list");
-    return;
-  }
-
-  GsApp *app = gs_app_list_index (install_list, 0);
-  if (app == NULL) {
-    g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
-                             "Failed to get app from install list");
-    return;
-  }
-
-  const gchar *package_name = gs_app_get_metadata_item (app, "openstore::package-name");
-  g_debug ("Installed app %s from Open Store", package_name);
-
   result = g_dbus_proxy_call_finish (G_DBUS_PROXY (source_object), res, &local_error);
   if (result == NULL) {
-    gs_app_set_state_recover (app);
+    /* D-Bus error — couldn't even queue the request */
+    g_hash_table_remove_all (self->active_package_map);
+    self->current_progress_callback = NULL;
+    self->current_progress_user_data = NULL;
+    if (install_list != NULL && gs_app_list_length (install_list) > 0)
+      gs_app_set_state_recover (gs_app_list_index (install_list, 0));
     g_dbus_error_strip_remote_error (local_error);
     g_task_return_error (task, g_steal_pointer (&local_error));
     return;
   }
 
-  gs_app_set_state (app, GS_APP_STATE_INSTALLED);
-  g_task_return_boolean (task, TRUE);
+  gboolean queued = FALSE;
+  g_variant_get (result, "(b)", &queued);
+  if (!queued) {
+    /* Service rejected the request before queuing */
+    g_hash_table_remove_all (self->active_package_map);
+    self->current_progress_callback = NULL;
+    self->current_progress_user_data = NULL;
+    if (install_list != NULL && gs_app_list_length (install_list) > 0)
+      gs_app_set_state_recover (gs_app_list_index (install_list, 0));
+    g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
+                             "Install request rejected");
+    return;
+  }
+
+  /* Queued — wait for AppInstalled or InstallFailed signal */
+  g_clear_object (&self->pending_install_task);
+  self->pending_install_task = g_steal_pointer (&task);
 }
 
 static gboolean
@@ -895,35 +943,31 @@ openstore_upgrade_packages_cb (GObject *source_object,
   GsPluginOpenStore *self = GS_PLUGIN_OPENSTORE (g_task_get_source_object (task));
   g_autoptr (GError) local_error = NULL;
   g_autoptr (GVariant) result = NULL;
-  GsAppList *list = g_task_get_task_data (task);
-  gboolean success = FALSE;
-
-  g_hash_table_remove_all (self->active_package_map);
-  self->current_progress_callback = NULL;
-  self->current_progress_user_data = NULL;
 
   result = g_dbus_proxy_call_finish (G_DBUS_PROXY (source_object), res, &local_error);
   if (result == NULL) {
+    g_hash_table_remove_all (self->active_package_map);
+    self->current_progress_callback = NULL;
+    self->current_progress_user_data = NULL;
     g_dbus_error_strip_remote_error (local_error);
     g_task_return_error (task, g_steal_pointer (&local_error));
     return;
   }
 
-  g_variant_get (result, "(b)", &success);
-  if (!success) {
+  gboolean queued = FALSE;
+  g_variant_get (result, "(b)", &queued);
+  if (!queued) {
+    g_hash_table_remove_all (self->active_package_map);
+    self->current_progress_callback = NULL;
+    self->current_progress_user_data = NULL;
     g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
-                             "Failed to upgrade packages");
+                             "Upgrade request rejected");
     return;
   }
 
-  for (guint i = 0; i < gs_app_list_length (list); i++) {
-    GsApp *app = gs_app_list_index (list, i);
-    gs_app_set_state (app, GS_APP_STATE_INSTALLED);
-    g_debug ("Updated app: %s", gs_app_get_unique_id (app));
-  }
-
-  gs_plugin_updates_changed (GS_PLUGIN (self));
-  g_task_return_boolean (task, TRUE);
+  /* Queued — wait for UpgradeComplete signal */
+  g_clear_object (&self->pending_upgrade_task);
+  self->pending_upgrade_task = g_steal_pointer (&task);
 }
 
 static gboolean
@@ -1006,6 +1050,16 @@ gs_plugin_openstore_dispose (GObject *object)
 {
   GsPluginOpenStore *self = GS_PLUGIN_OPENSTORE (object);
 
+  if (self->pending_install_task != NULL) {
+    g_task_return_new_error (self->pending_install_task, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                             "Plugin disposed");
+    g_clear_object (&self->pending_install_task);
+  }
+  if (self->pending_upgrade_task != NULL) {
+    g_task_return_new_error (self->pending_upgrade_task, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                             "Plugin disposed");
+    g_clear_object (&self->pending_upgrade_task);
+  }
   g_clear_object (&self->openstore_proxy);
   g_clear_object (&self->installed_apps);
   g_clear_object (&self->updatable_apps);
